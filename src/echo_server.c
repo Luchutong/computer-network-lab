@@ -6,11 +6,44 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <string.h>
+#include "parse.h"
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
 
 int sock = -1, client_sock = -1;
 char buf[BUF_SIZE];
+
+static int build_encapsulated_request(const Request *request, char *out, size_t out_size) {
+    if (request == NULL || out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    int written = snprintf(out, out_size, "%s %s %s\r\n",
+                           request->http_method,
+                           request->http_uri,
+                           request->http_version);
+    if (written < 0 || (size_t) written >= out_size) {
+        return -1;
+    }
+
+    size_t offset = (size_t) written;
+    for (int i = 0; i < request->header_count; i++) {
+        written = snprintf(out + offset, out_size - offset, "%s: %s\r\n",
+                           request->headers[i].header_name,
+                           request->headers[i].header_value);
+        if (written < 0 || (size_t) written >= out_size - offset) {
+            return -1;
+        }
+        offset += (size_t) written;
+    }
+
+    written = snprintf(out + offset, out_size - offset, "\r\n");
+    if (written < 0 || (size_t) written >= out_size - offset) {
+        return -1;
+    }
+
+    return (int) (offset + (size_t) written);
+}
 
 int close_socket(int sock) {
     if (close(sock)) {
@@ -97,11 +130,36 @@ int main(int argc, char *argv[]) {
              /* receive msg from client, and concatenate msg with "(echo back)" to send back */
             memset(buf, 0, BUF_SIZE);
             int readret = recv(client_sock, buf, BUF_SIZE, 0);
-            if (readret <0)break;
-            fprintf(stdout,"Received (total %d bytes):%s \n",readret,buf); 
-            strcat(buf,"(echo back)");
-            if(send(client_sock, buf, strlen(buf), 0) < 0)break;
-            fprintf(stdout,"Send back\n");
+            if (readret <= 0) break;
+            fprintf(stdout,"Received (total %d bytes):\n%.*s\n",readret,readret,buf);
+
+            Request *request = parse(buf, readret, client_sock);
+            if (request == NULL) {
+                const char *bad_request = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+                send(client_sock, bad_request, strlen(bad_request), 0);
+                break;
+            }
+
+            char response[BUF_SIZE];
+            int response_len = -1;
+            if (strcmp(request->http_method, "GET") == 0 ||
+                strcmp(request->http_method, "HEAD") == 0 ||
+                strcmp(request->http_method, "POST") == 0) {
+                response_len = build_encapsulated_request(request, response, sizeof(response));
+            } else {
+                response_len = snprintf(response, sizeof(response),
+                                        "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
+            }
+
+            if (response_len <= 0 || send(client_sock, response, (size_t) response_len, 0) < 0) {
+                free(request->headers);
+                free(request);
+                break;
+            }
+
+            fprintf(stdout,"Send encapsulated response for method: %s\n", request->http_method);
+            free(request->headers);
+            free(request);
             /* when client is closing the connection：
                 FIN of client carrys empty，so recv() return 0
                 ACK of server only carrys"(echo back)", so send() return 11

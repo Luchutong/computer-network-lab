@@ -59,12 +59,13 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
         
-    char msg[BUF_SIZE]; 
-    fgets(msg, BUF_SIZE, stdin);
-    
+    char msg[BUF_SIZE];
+    size_t total_to_send = fread(msg, 1, BUF_SIZE - 1, stdin);
+    msg[total_to_send] = '\0';
+
     int bytes_received;
     fprintf(stdout, "Sending %s", msg);
-    send(sock, msg , strlen(msg), 0);
+    send(sock, msg, total_to_send, 0);
     if((bytes_received = recv(sock, buf, BUF_SIZE, 0)) > 1)
     {
         buf[bytes_received] = '\0';
