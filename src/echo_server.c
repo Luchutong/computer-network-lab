@@ -12,12 +12,15 @@
 
 int sock = -1, client_sock = -1;
 char buf[BUF_SIZE];
-
+/*把 parse 产生的结构化请求 Request，重新拼装成一段完整的 HTTP 请求文本，写入调用方提供的输出缓冲区。
+ *封装函数
+ */
 static int build_encapsulated_request(const Request *request, char *out, size_t out_size) {
+    
     if (request == NULL || out == NULL || out_size == 0) {
         return -1;
     }
-
+    //写入缓存
     int written = snprintf(out, out_size, "%s %s %s\r\n",
                            request->http_method,
                            request->http_uri,
@@ -27,6 +30,7 @@ static int build_encapsulated_request(const Request *request, char *out, size_t 
     }
 
     size_t offset = (size_t) written;
+    //写入请求体，并用offset偏移量来记录已经写入的字节数，确保不会越界
     for (int i = 0; i < request->header_count; i++) {
         written = snprintf(out + offset, out_size - offset, "%s: %s\r\n",
                            request->headers[i].header_name,
@@ -41,7 +45,7 @@ static int build_encapsulated_request(const Request *request, char *out, size_t 
     if (written < 0 || (size_t) written >= out_size - offset) {
         return -1;
     }
-
+    //返回总的字节数
     return (int) (offset + (size_t) written);
 }
 
@@ -127,7 +131,7 @@ int main(int argc, char *argv[]) {
         }
         fprintf(stdout,"New connection from %s:%d\n",inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
         while(1){
-             /* receive msg from client, and concatenate msg with "(echo back)" to send back */
+            
             memset(buf, 0, BUF_SIZE);
             int readret = recv(client_sock, buf, BUF_SIZE, 0);
             if (readret <= 0) break;
@@ -150,7 +154,7 @@ int main(int argc, char *argv[]) {
                 response_len = snprintf(response, sizeof(response),
                                         "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
             }
-
+            
             if (response_len <= 0 || send(client_sock, response, (size_t) response_len, 0) < 0) {
                 free(request->headers);
                 free(request);
