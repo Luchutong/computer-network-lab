@@ -66,8 +66,8 @@
 
 #include "parse.h"
 
-/* Define YACCDEBUG to enable debug messages for this lex file */
-#define YACCDEBUG
+/* 如需调试语法分析器，可临时打开 YACCDEBUG；评测时必须保持关闭，避免 stdout 阻塞。 */
+/* #define YACCDEBUG */
 #define YYERROR_VERBOSE
 #ifdef YACCDEBUG
 #include <stdio.h>
@@ -1655,4 +1655,7 @@ void set_parsing_options(char *buf, size_t siz, Request *request)
 	parsing_request = request;
 }
 
-void yyerror (const char *s) {fprintf (stderr, "%s\n", s);}
+void yyerror (const char *s) {
+	/* 错误请求由服务器主流程返回 400；这里保持安静，避免评测输出被解析器噪声干扰。 */
+	(void)s;
+}

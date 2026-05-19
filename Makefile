@@ -43,5 +43,5 @@ $(OBJ_DIR):
 	mkdir $@
 
 clean:
-	$(RM) $(OBJ) $(BIN) $(LEGACY_BIN) $(SRC_DIR)/lex.yy.c $(SRC_DIR)/y.tab.*
+	$(RM) $(OBJ) $(BIN) $(LEGACY_BIN)
 	$(RM) -r $(OBJ_DIR)

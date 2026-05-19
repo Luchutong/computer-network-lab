@@ -1,5 +1,8 @@
 #include "parse.h"
 
+/* flex 词法分析器保存了全局扫描状态；长连接多次 parse 前后必须显式重置。 */
+extern int yylex_destroy(void);
+
 /**
 * Given a char buffer returns the parsed request headers
 */
@@ -51,13 +54,30 @@ Request *parse(const char *buffer, const int size, int socketFd) {
     //Valid End State
     if (state == STATE_CRLFCRLF) {
         Request *request = malloc(sizeof(Request));
+        if (request == NULL) {
+            return NULL;
+        }
         request->header_count = 0;
         request->headers = (Request_header *) malloc(sizeof(Request_header) * 1);
+        if (request->headers == NULL) {
+            free(request);
+            return NULL;
+        }
         set_parsing_options(parse_buf, i, request);
 
         if (yyparse() == SUCCESS) {
+            yylex_destroy();
             return request;
         }
+
+        /*
+         * yyparse() 失败时不能把 flex 的 EOF/缓冲区状态留给下一条请求。
+         * 第三阶段 pipeline 会在同一进程内连续解析很多请求，若不清理，
+         * 后续合法 GET/HEAD 可能被前一次解析状态污染并误判为 400。
+         */
+        yylex_destroy();
+        free(request->headers);
+        free(request);
     }
 
     return NULL;

@@ -15,8 +15,8 @@
 #include "y.tab.h"
 
 
-/* Define LEXDEBUG to enable debug messages for this lex file */
-#define LEXDEBUG
+/* 如需调试词法分析器，可临时打开 LEXDEBUG；评测时必须保持关闭，避免 stdout 阻塞。 */
+/* #define LEXDEBUG */
 #ifdef LEXDEBUG
 #include <stdio.h>
 #define LPRINTF(...) printf(__VA_ARGS__)
