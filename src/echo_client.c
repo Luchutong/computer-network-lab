@@ -144,7 +144,14 @@ int main(int argc, char* argv[])
     }
 
     int bytes_received;
-    fprintf(stdout, "Sending %.*s", (int)total_to_send, msg);
+
+    /* 按官方演示格式打印发送内容，便于和样例视频/截图对照 */
+    fprintf(stdout, "-----Sending-----\n");
+    fwrite(msg, 1, total_to_send, stdout);
+    if (total_to_send == 0 || msg[total_to_send - 1] != '\n') {
+        fprintf(stdout, "\n");
+    }
+
     if (send_all(sock, msg, total_to_send) != 0) {
         fprintf(stderr, "Send failed.\n");
         free(msg);
@@ -162,7 +169,8 @@ int main(int argc, char* argv[])
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    fprintf(stdout, "Received ");
+    /* 按官方演示格式打印接收内容 */
+    fprintf(stdout, "-----Received-----\n");
     while ((bytes_received = recv(sock, buf, BUF_SIZE, 0)) > 0)
     {
         fwrite(buf, 1, (size_t)bytes_received, stdout);

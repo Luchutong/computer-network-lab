@@ -9,12 +9,17 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <time.h>
 #include "parse.h"
 #define LISO_PORT 9999
 #define BUF_SIZE 4096
 #define MAX_HEADER_SIZE 8192
 #define INITIAL_CONN_BUF_SIZE 8192
 #define STATIC_ROOT "static_site"
+#define LOG_DIR "logs"
+#define ACCESS_LOG_PATH "logs/access.log"
+#define ERROR_LOG_PATH "logs/error.log"
 
 int sock = -1, client_sock = -1;
 char buf[BUF_SIZE];
@@ -54,6 +59,33 @@ static int header_name_equals(const char *start, int len, const char *name) {
         }
     }
     return 1;
+}
+
+/* 判断 HTTP 版本字段是否是 HTTP/<数字>.<数字> 的合法形态 */
+static int http_version_has_valid_shape(const char *version) {
+    int pos = 5;
+    int major_digits = 0;
+    int minor_digits = 0;
+
+    if (version == NULL || strncmp(version, "HTTP/", 5) != 0) {
+        return 0;
+    }
+
+    while (version[pos] >= '0' && version[pos] <= '9') {
+        major_digits++;
+        pos++;
+    }
+    if (major_digits == 0 || version[pos] != '.') {
+        return 0;
+    }
+    pos++;
+
+    while (version[pos] >= '0' && version[pos] <= '9') {
+        minor_digits++;
+        pos++;
+    }
+
+    return minor_digits > 0 && version[pos] == '\0';
 }
 
 /*
@@ -171,10 +203,16 @@ static int classify_request_line(const char *data, int len) {
     line[line_end] = '\0';
 
     char method[64], uri[4096], version[64];
-    if (sscanf(line, "%63s %4095s %63s", method, uri, version) != 3) {
+    int consumed = 0;
+
+    if (sscanf(line, "%63s %4095s %63s %n", method, uri, version, &consumed) != 3) {
         return 0;
     }
-    if (strncmp(version, "HTTP/", 5) != 0) {
+    /* 请求行只能有 method、uri、version 三段，多余字段属于格式错误 */
+    if (consumed != line_end) {
+        return 0;
+    }
+    if (!http_version_has_valid_shape(version)) {
         return 0;
     }
 
@@ -196,6 +234,171 @@ static int send_all(int fd, const void *data, size_t len) {
             return -1;
         }
         sent += (size_t)n;
+    }
+
+    return 0;
+}
+
+/* 启动时创建日志目录；目录已存在不是错误 */
+static void init_logs(void) {
+    if (mkdir(LOG_DIR, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Failed creating log directory: %s\n", strerror(errno));
+    }
+}
+
+/* Apache Error Log 风格时间，例如 Wed Apr 22 12:34:56 2026 */
+static void format_error_time(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm tm_now;
+
+    localtime_r(&now, &tm_now);
+    strftime(buf, size, "%a %b %d %H:%M:%S %Y", &tm_now);
+}
+
+/* Apache Common Log Format 时间，例如 22/Apr/2026:12:34:56 +0800 */
+static void format_access_time(char *buf, size_t size) {
+    time_t now = time(NULL);
+    struct tm tm_now;
+
+    localtime_r(&now, &tm_now);
+    strftime(buf, size, "%d/%b/%Y:%H:%M:%S %z", &tm_now);
+}
+
+/* 记录服务器错误：格式近似 Apache Error Log */
+static void log_error_message(const char *fmt, ...) {
+    FILE *fp = fopen(ERROR_LOG_PATH, "a");
+    char time_buf[64];
+    va_list args;
+
+    if (fp == NULL) {
+        return;
+    }
+
+    format_error_time(time_buf, sizeof(time_buf));
+    fprintf(fp, "[%s] [error] ", time_buf);
+
+    va_start(args, fmt);
+    vfprintf(fp, fmt, args);
+    va_end(args);
+
+    fprintf(fp, "\n");
+    fclose(fp);
+}
+
+/* 从原始请求头中取出请求行，用于 access.log 的 "%r" 字段 */
+static void extract_request_line(const char *data, int len, char *out, size_t out_size) {
+    size_t i = 0;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    if (data == NULL || len <= 0) {
+        snprintf(out, out_size, "-");
+        return;
+    }
+
+    while (i + 1 < (size_t)len && i < out_size - 1) {
+        if (data[i] == '\r' && data[i + 1] == '\n') {
+            break;
+        }
+        out[i] = data[i];
+        i++;
+    }
+    out[i] = '\0';
+
+    if (out[0] == '\0') {
+        snprintf(out, out_size, "-");
+    }
+}
+
+/* 客户端关闭时若缓冲区只剩空白行，说明不是新请求，不应额外记一次 400 */
+static int buffer_is_only_blank(const char *data, size_t len) {
+    if (data == NULL) {
+        return 1;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] != '\r' && data[i] != '\n' &&
+            data[i] != ' ' && data[i] != '\t') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* 记录访问日志：Common Log Format，即 host ident user [time] "request" status bytes */
+static void log_access_request(const struct sockaddr_in *cli_addr,
+                               const char *request_line,
+                               int status_code,
+                               size_t bytes_sent) {
+    FILE *fp = fopen(ACCESS_LOG_PATH, "a");
+    char ip[INET_ADDRSTRLEN];
+    char time_buf[64];
+    const char *line = request_line;
+
+    if (fp == NULL) {
+        return;
+    }
+
+    if (cli_addr == NULL ||
+        inet_ntop(AF_INET, &cli_addr->sin_addr, ip, sizeof(ip)) == NULL) {
+        snprintf(ip, sizeof(ip), "0.0.0.0");
+    }
+    if (line == NULL || line[0] == '\0') {
+        line = "-";
+    }
+
+    format_access_time(time_buf, sizeof(time_buf));
+    fprintf(fp, "%s - - [%s] \"%s\" %d %zu\n",
+            ip, time_buf, line, status_code, bytes_sent);
+    fclose(fp);
+}
+
+/* 从 HTTP 响应状态行中提取状态码；POST echo 没有状态行时按成功处理 */
+static int response_status_code(const char *response, int response_len) {
+    int status_code = 200;
+
+    if (response != NULL && response_len > 0 &&
+        strncmp(response, "HTTP/", 5) == 0 &&
+        sscanf(response, "HTTP/%*s %d", &status_code) == 1) {
+        return status_code;
+    }
+
+    return 200;
+}
+
+/* Common Log Format 的 bytes 字段按响应体长度记录，不包含响应头 */
+static size_t response_body_bytes(const char *response, int response_len) {
+    int header_len;
+
+    if (response == NULL || response_len <= 0) {
+        return 0;
+    }
+    if (strncmp(response, "HTTP/", 5) != 0) {
+        return (size_t)response_len;
+    }
+
+    header_len = find_request_end(response, response_len);
+    if (header_len < 0 || header_len > response_len) {
+        return 0;
+    }
+
+    return (size_t)(response_len - header_len);
+}
+
+/* HTTP/1.1 请求必须带 Host 头，头名大小写不敏感 */
+static int request_has_host_header(const Request *request) {
+    if (request == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < request->header_count; i++) {
+        int name_len = (int)strlen(request->headers[i].header_name);
+        if (header_name_equals(request->headers[i].header_name, name_len, "Host")) {
+            return 1;
+        }
     }
 
     return 0;
@@ -278,7 +481,7 @@ static const char *guess_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
-/* 将 URI 安全地映射到 static_site 目录，防止 ../ 路径穿越 */
+/* 将 URI 安全地映射到 static_site 目录，防止 ../ 路径穿越；-2 表示非法路径 */
 static int build_static_path(const char *uri, char *path, size_t path_size) {
     char clean_uri[4096];
     size_t uri_len = 0;
@@ -287,7 +490,7 @@ static int build_static_path(const char *uri, char *path, size_t path_size) {
         return -1;
     }
     if (strstr(uri, "..") != NULL || strchr(uri, '\\') != NULL) {
-        return -1;
+        return -2;
     }
 
     /* 去掉查询串：/index.html?a=1 按 /index.html 处理 */
@@ -325,22 +528,32 @@ static int build_encapsulated_request(const Request *request,
         return build_error_response(505, out);
     }
 
+    /* HTTP/1.1 要求必须出现 Host 头，缺失时属于请求格式错误 */
+    if (!request_has_host_header(request)) {
+        log_error_message("HTTP/1.1 request missing Host header");
+        return build_error_response(400, out);
+    }
+
     /* GET/HEAD：从 static_site 中读取静态文件并构造 HTTP 响应 */
     if (strcmp(request->http_method, "GET") == 0 || strcmp(request->http_method, "HEAD") == 0) {
         char path[4096];
         struct stat st;
         int is_head = strcmp(request->http_method, "HEAD") == 0;
 
-        if (build_static_path(request->http_uri, path, sizeof(path)) != 0) {
-            return build_error_response(400, out);
+        int path_result = build_static_path(request->http_uri, path, sizeof(path));
+        if (path_result != 0) {
+            log_error_message("invalid static path for uri \"%s\"", request->http_uri);
+            return build_error_response(path_result == -2 ? 404 : 400, out);
         }
         if (stat(path, &st) != 0) {
             /* stat 失败时区分不存在、权限不足和其他磁盘/路径错误 */
+            log_error_message("stat() failed for \"%s\": %s", path, strerror(errno));
             int status = file_errno_to_status(errno);
             return build_error_response(status, out);
         }
         if (!S_ISREG(st.st_mode) || st.st_size < 0) {
             /* 目录、设备文件等都不是本实验要服务的普通静态文件 */
+            log_error_message("\"%s\" is not a readable regular file", path);
             return build_error_response(404, out);
         }
 
@@ -362,6 +575,7 @@ static int build_encapsulated_request(const Request *request,
         size_t total_len = (size_t)header_len + body_len;
         *out = (char *)malloc(total_len);
         if (*out == NULL) {
+            log_error_message("malloc() failed while building response for \"%s\"", path);
             return build_error_response(500, out);
         }
         memcpy(*out, header, (size_t)header_len);
@@ -374,6 +588,7 @@ static int build_encapsulated_request(const Request *request,
         FILE *fp = fopen(path, "rb");
         if (fp == NULL) {
             /* fopen 失败时同样区分权限、文件消失和其他 IO 错误 */
+            log_error_message("fopen() failed for \"%s\": %s", path, strerror(errno));
             int status = file_errno_to_status(errno);
             free(*out);
             *out = NULL;
@@ -385,7 +600,8 @@ static int build_encapsulated_request(const Request *request,
         fclose(fp);
         if (read_len != body_len) {
             /* fread 短读或底层 IO 错误都说明磁盘读取失败，返回 500 而不是静默断连 */
-            (void)read_failed;
+            log_error_message("fread() failed for \"%s\": expected %zu bytes, got %zu, ferror=%d",
+                              path, body_len, read_len, read_failed);
             free(*out);
             *out = NULL;
             return build_error_response(500, out);
@@ -401,6 +617,7 @@ static int build_encapsulated_request(const Request *request,
         }
         *out = (char *)malloc(raw_request_len);
         if (*out == NULL) {
+            log_error_message("malloc() failed while echoing POST request");
             return -1;
         }
         memcpy(*out, raw_request, raw_request_len);
@@ -447,16 +664,19 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, handle_sigpipe);
     socklen_t cli_size;
     struct sockaddr_in addr, cli_addr;
+    init_logs();
     fprintf(stdout, "----- Liso Server -----\n");
 
     /* all networked programs must create a socket */
     if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1) {
+        log_error_message("socket() failed: %s", strerror(errno));
         fprintf(stderr, "Failed creating socket.\n");
         return EXIT_FAILURE;
     }
     /* set socket SO_REUSEADDR | SO_REUSEPORT */
     int opt = 1;
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        log_error_message("setsockopt() failed: %s", strerror(errno));
         fprintf(stderr, "Failed setting socket options.\n");
         return EXIT_FAILURE;
     }
@@ -467,12 +687,14 @@ int main(int argc, char *argv[]) {
 
     /* servers bind sockets to ports---notify the OS they accept connections */
     if (bind(sock, (struct sockaddr *) &addr, sizeof(addr))) {
+        log_error_message("bind() failed on port %d: %s", LISO_PORT, strerror(errno));
         close_socket(sock);
         fprintf(stderr, "Failed binding socket.\n");
         return EXIT_FAILURE;
     }
 
     if (listen(sock, 5)) {
+        log_error_message("listen() failed: %s", strerror(errno));
         close_socket(sock);
         fprintf(stderr, "Error listening on socket.\n");
         return EXIT_FAILURE;
@@ -487,6 +709,7 @@ int main(int argc, char *argv[]) {
         client_sock = accept(sock, (struct sockaddr *) &cli_addr, &cli_size);
         if (client_sock == -1)
         {
+            log_error_message("accept() failed: %s", strerror(errno));
             fprintf(stderr, "Error accepting connection.\n");
             close_socket(sock);
             return EXIT_FAILURE;
@@ -498,6 +721,7 @@ int main(int argc, char *argv[]) {
         int close_connection = 0;
 
         if (conn_buf == NULL) {
+            log_error_message("malloc() failed while creating connection buffer");
             close_socket(client_sock);
             continue;
         }
@@ -506,13 +730,21 @@ int main(int argc, char *argv[]) {
 
             int readret = recv(client_sock, buf, BUF_SIZE, 0);
             if (readret < 0) {
+                log_error_message("recv() failed from %s:%d: %s",
+                                  inet_ntoa(cli_addr.sin_addr),
+                                  ntohs(cli_addr.sin_port),
+                                  strerror(errno));
                 break;
             }
             if (readret == 0) {
                 /* 对端关闭连接时若仍有残缺报文，按格式错误处理 */
-                if (conn_len > 0) {
+                if (conn_len > 0 && !buffer_is_only_blank(conn_buf, conn_len)) {
                     const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-                    send(client_sock, bad_request, strlen(bad_request), 0);
+                    char request_line[512];
+                    extract_request_line(conn_buf, (int)conn_len, request_line, sizeof(request_line));
+                    if (send(client_sock, bad_request, strlen(bad_request), 0) >= 0) {
+                        log_access_request(&cli_addr, request_line, 400, 0);
+                    }
                 }
                 break;
             }
@@ -534,7 +766,12 @@ int main(int argc, char *argv[]) {
                 new_buf = (char *)realloc(conn_buf, new_cap);
                 if (new_buf == NULL) {
                     const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-                    send(client_sock, bad_request, strlen(bad_request), 0);
+                    char request_line[512];
+                    extract_request_line(conn_buf, (int)conn_len, request_line, sizeof(request_line));
+                    log_error_message("realloc() failed while growing connection buffer to %zu bytes", new_cap);
+                    if (send(client_sock, bad_request, strlen(bad_request), 0) >= 0) {
+                        log_access_request(&cli_addr, request_line, 400, 0);
+                    }
                     break;
                 }
                 conn_buf = new_buf;
@@ -556,7 +793,12 @@ int main(int argc, char *argv[]) {
                     /* 只在请求头尚未结束且已经超过 8192 字节时返回 400 */
                     if (conn_len > MAX_HEADER_SIZE) {
                         const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-                        send(client_sock, bad_request, strlen(bad_request), 0);
+                        char request_line[512];
+                        extract_request_line(conn_buf, (int)conn_len, request_line, sizeof(request_line));
+                        log_error_message("request header is larger than %d bytes", MAX_HEADER_SIZE);
+                        if (send(client_sock, bad_request, strlen(bad_request), 0) >= 0) {
+                            log_access_request(&cli_addr, request_line, 400, 0);
+                        }
                         conn_len = 0;
                         close_connection = 1;
                     }
@@ -567,7 +809,12 @@ int main(int argc, char *argv[]) {
                 if (header_len > MAX_HEADER_SIZE ||
                     get_content_length_from_header(conn_buf, header_len, &content_length) != 0) {
                     const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-                    send(client_sock, bad_request, strlen(bad_request), 0);
+                    char request_line[512];
+                    extract_request_line(conn_buf, header_len, request_line, sizeof(request_line));
+                    log_error_message("bad request header or invalid Content-Length");
+                    if (send(client_sock, bad_request, strlen(bad_request), 0) >= 0) {
+                        log_access_request(&cli_addr, request_line, 400, 0);
+                    }
                     conn_len = 0;
                     close_connection = 1;
                     break;
@@ -575,7 +822,12 @@ int main(int argc, char *argv[]) {
 
                 if (content_length > (size_t)INT_MAX || (size_t)header_len > (size_t)INT_MAX - content_length) {
                     const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
-                    send(client_sock, bad_request, strlen(bad_request), 0);
+                    char request_line[512];
+                    extract_request_line(conn_buf, header_len, request_line, sizeof(request_line));
+                    log_error_message("request body length is too large: %zu bytes", content_length);
+                    if (send(client_sock, bad_request, strlen(bad_request), 0) >= 0) {
+                        log_access_request(&cli_addr, request_line, 400, 0);
+                    }
                     conn_len = 0;
                     close_connection = 1;
                     break;
@@ -587,27 +839,35 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
+                char request_line[512];
+                extract_request_line(conn_buf, header_len, request_line, sizeof(request_line));
                 int request_type = classify_request_line(conn_buf, header_len);
                 if (request_type == 0) {
                     const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
                     if (send(client_sock, bad_request, strlen(bad_request), 0) < 0) {
+                        log_error_message("send() failed while returning 400: %s", strerror(errno));
                         conn_len = 0;
                         break;
                     }
+                    log_access_request(&cli_addr, request_line, 400, 0);
                 } else if (request_type == -1) {
                     const char *not_impl = "HTTP/1.1 501 Not Implemented\r\n\r\n";
                     if (send(client_sock, not_impl, strlen(not_impl), 0) < 0) {
+                        log_error_message("send() failed while returning 501: %s", strerror(errno));
                         conn_len = 0;
                         break;
                     }
+                    log_access_request(&cli_addr, request_line, 501, 0);
                 } else {
                     Request *request = parse(conn_buf, header_len, client_sock);
                     if (request == NULL) {
                         const char *bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
                         if (send(client_sock, bad_request, strlen(bad_request), 0) < 0) {
+                            log_error_message("send() failed after parse error: %s", strerror(errno));
                             conn_len = 0;
                             break;
                         }
+                        log_access_request(&cli_addr, request_line, 400, 0);
                         if (full_req_len < conn_len) {
                             memmove(conn_buf, conn_buf + full_req_len, conn_len - full_req_len);
                         }
@@ -622,6 +882,9 @@ int main(int argc, char *argv[]) {
 
                     if (response_len <= 0 || response == NULL ||
                         send_all(client_sock, response, (size_t)response_len) < 0) {
+                        log_error_message("send_all() failed for \"%s\": %s",
+                                          request_line,
+                                          strerror(errno));
                         free(response);
                         free(request->headers);
                         free(request);
@@ -630,6 +893,10 @@ int main(int argc, char *argv[]) {
                     }
 
                     fprintf(stdout,"Send response for method: %s\n", request->http_method);
+                    log_access_request(&cli_addr,
+                                       request_line,
+                                       response_status_code(response, response_len),
+                                       response_body_bytes(response, response_len));
                     free(response);
                     free(request->headers);
                     free(request);
