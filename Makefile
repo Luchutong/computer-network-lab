@@ -8,6 +8,10 @@ OBJ := $(OBJ_DIR)/y.tab.o $(OBJ_DIR)/lex.yy.o $(OBJ_DIR)/parse.o $(OBJ_DIR)/exam
 BIN := example liso_server liso_client
 # legacy build outputs to remove when cleaning
 LEGACY_BIN := echo_server echo_client
+# handin archive name
+TAR_NAME := Liso.tar
+# project files required by the autograder; do not include binaries, obj, logs, or old archives
+TAR_CONTENTS := Dockerfile Makefile README.md cgi include samples src static_site
 # C compiler
 CC  := gcc
 # C PreProcessor Flag
@@ -45,3 +49,7 @@ $(OBJ_DIR):
 clean:
 	$(RM) $(OBJ) $(BIN) $(LEGACY_BIN)
 	$(RM) -r $(OBJ_DIR)
+
+tar:
+	$(RM) $(TAR_NAME)
+	tar cvf $(TAR_NAME) $(TAR_CONTENTS)

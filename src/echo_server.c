@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include <limits.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -16,6 +17,7 @@
 #define BUF_SIZE 4096
 #define MAX_HEADER_SIZE 8192
 #define INITIAL_CONN_BUF_SIZE 8192
+#define MAX_CLIENTS 1024
 #define STATIC_ROOT "static_site"
 #define LOG_DIR "logs"
 #define ACCESS_LOG_PATH "logs/access.log"
@@ -27,8 +29,7 @@
 #define RESPONSE_501 "HTTP/1.1 501 Not Implemented\r\n\r\n"
 #define RESPONSE_505 "HTTP/1.1 505 HTTP Version not supported\r\n\r\n"
 
-int sock = -1, client_sock = -1;
-char buf[BUF_SIZE];
+int sock = -1;
 
 typedef enum {
     PIPELINE_NEED_MORE = 0,
@@ -42,6 +43,15 @@ typedef struct {
     size_t content_length;
     size_t full_len;
 } PipelineRequestSlice;
+
+typedef struct {
+    int fd;
+    int active;
+    struct sockaddr_in addr;
+    char *conn_buf;
+    size_t conn_len;
+    size_t conn_cap;
+} ClientConn;
 
 /* 在缓冲区中查找一个完整 HTTP 请求头的结束位置（\r\n\r\n） */
 static int find_request_end(const char *data, int len) {
@@ -667,13 +677,18 @@ static int build_encapsulated_request(const Request *request,
 
     *out = NULL;
 
-    /* 第二阶段只支持 HTTP/1.1，其他 HTTP 版本返回 505 */
-    if (strcmp(request->http_version, "HTTP/1.1") != 0) {
+    /*
+     * 第四阶段性能测试常用 ApacheBench，其默认请求为 HTTP/1.0。
+     * 这里兼容 HTTP/1.0 和 HTTP/1.1；其它形态合法但不支持的版本仍返回 505。
+     */
+    if (strcmp(request->http_version, "HTTP/1.1") != 0 &&
+        strcmp(request->http_version, "HTTP/1.0") != 0) {
         return build_error_response(505, out);
     }
 
-    /* HTTP/1.1 要求必须出现 Host 头，缺失时属于请求格式错误 */
-    if (!request_has_host_header(request)) {
+    /* HTTP/1.1 要求必须出现 Host 头；HTTP/1.0 兼容模式下不强制该字段 */
+    if (strcmp(request->http_version, "HTTP/1.1") == 0 &&
+        !request_has_host_header(request)) {
         log_error_message("HTTP/1.1 request missing Host header");
         return build_error_response(400, out);
     }
@@ -683,6 +698,8 @@ static int build_encapsulated_request(const Request *request,
         char path[4096];
         struct stat st;
         int is_head = strcmp(request->http_method, "HEAD") == 0;
+        int is_http10 = strcmp(request->http_version, "HTTP/1.0") == 0;
+        const char *connection_value = is_http10 ? "close" : "keep-alive";
 
         int path_result = build_static_path(request->http_uri, path, sizeof(path));
         if (path_result != 0) {
@@ -704,13 +721,16 @@ static int build_encapsulated_request(const Request *request,
         const char *mime = guess_mime_type(path);
         char header[1024];
         int header_len = snprintf(header, sizeof(header),
-                                  "HTTP/1.1 200 OK\r\n"
+                                  "%s 200 OK\r\n"
                                   "Server: Liso/1.0\r\n"
                                   "Content-Length: %ld\r\n"
                                   "Content-Type: %s\r\n"
-                                  "Connection: keep-alive\r\n"
+                                  "Connection: %s\r\n"
                                   "\r\n",
-                                  (long)st.st_size, mime);
+                                  request->http_version,
+                                  (long)st.st_size,
+                                  mime,
+                                  connection_value);
         if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
             return -1;
         }
@@ -779,6 +799,271 @@ int close_socket(int sock) {
     }
     return 0;
 }
+
+/* 初始化客户端连接表；第四阶段要求最多支持 1024 个连接槽位 */
+static void init_clients(ClientConn clients[], int count) {
+    for (int i = 0; i < count; i++) {
+        clients[i].fd = -1;
+        clients[i].active = 0;
+        clients[i].conn_buf = NULL;
+        clients[i].conn_len = 0;
+        clients[i].conn_cap = 0;
+        memset(&clients[i].addr, 0, sizeof(clients[i].addr));
+    }
+}
+
+/* 关闭并清理单个客户端；只释放该客户端资源，不影响其它并发连接 */
+static void close_client(ClientConn *client) {
+    if (client == NULL || !client->active) {
+        return;
+    }
+
+    if (client->fd != -1 && close_socket(client->fd) != 0) {
+        log_error_message("close() failed for client fd %d", client->fd);
+    }
+
+    free(client->conn_buf);
+    client->fd = -1;
+    client->active = 0;
+    client->conn_buf = NULL;
+    client->conn_len = 0;
+    client->conn_cap = 0;
+    memset(&client->addr, 0, sizeof(client->addr));
+}
+
+/* 为新 accept 的 socket 分配连接槽位和独立缓冲区 */
+static int add_client(ClientConn clients[],
+                      int count,
+                      int fd,
+                      const struct sockaddr_in *addr) {
+    if (fd < 0 || fd >= FD_SETSIZE) {
+        log_error_message("rejecting client fd %d because it exceeds FD_SETSIZE", fd);
+        return -1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!clients[i].active) {
+            clients[i].conn_buf = (char *)malloc(INITIAL_CONN_BUF_SIZE);
+            if (clients[i].conn_buf == NULL) {
+                log_error_message("malloc() failed while creating client buffer");
+                return -1;
+            }
+            clients[i].fd = fd;
+            clients[i].active = 1;
+            clients[i].conn_len = 0;
+            clients[i].conn_cap = INITIAL_CONN_BUF_SIZE;
+            if (addr != NULL) {
+                clients[i].addr = *addr;
+            } else {
+                memset(&clients[i].addr, 0, sizeof(clients[i].addr));
+            }
+            return 0;
+        }
+    }
+
+    log_error_message("too many active clients, rejecting fd %d", fd);
+    return -1;
+}
+
+/* 追加 recv 到的数据；每个客户端有自己的缓冲区，因此半包不会阻塞其他客户端 */
+static int append_client_data(ClientConn *client, const char *data, size_t len) {
+    size_t need;
+    size_t new_cap;
+    char *new_buf = NULL;
+
+    if (client == NULL || data == NULL || len == 0) {
+        return 0;
+    }
+
+    need = client->conn_len + len;
+    if (need > client->conn_cap) {
+        new_cap = client->conn_cap;
+        while (new_cap < need) {
+            if (new_cap > (size_t)INT_MAX / 2) {
+                new_cap = need;
+                break;
+            }
+            new_cap *= 2;
+        }
+
+        new_buf = (char *)realloc(client->conn_buf, new_cap);
+        if (new_buf == NULL) {
+            char request_line[512];
+            extract_request_line(client->conn_buf,
+                                 client->conn_len > (size_t)INT_MAX ? INT_MAX : (int)client->conn_len,
+                                 request_line,
+                                 sizeof(request_line));
+            log_error_message("realloc() failed while growing client buffer to %zu bytes", new_cap);
+            if (send_error_response(client->fd, 400) > 0) {
+                log_access_request(&client->addr, request_line, 400, 0);
+            }
+            return -1;
+        }
+        client->conn_buf = new_buf;
+        client->conn_cap = new_cap;
+    }
+
+    memcpy(client->conn_buf + client->conn_len, data, len);
+    client->conn_len += len;
+    return 0;
+}
+
+/* 处理单个客户端缓冲区中的完整请求，保持第三阶段 pipeline 顺序语义 */
+static int process_client_buffer(ClientConn *client) {
+    if (client == NULL || !client->active) {
+        return -1;
+    }
+
+    while (1) {
+        PipelineRequestSlice slice;
+        PipelineStatus pipeline_status =
+            extract_pipeline_request(client->conn_buf, client->conn_len, &slice);
+        char request_line[512];
+
+        if (pipeline_status == PIPELINE_NEED_MORE) {
+            return 0;
+        }
+
+        if (pipeline_status == PIPELINE_FATAL_ERROR) {
+            int line_len = client->conn_len > (size_t)INT_MAX ? INT_MAX : (int)client->conn_len;
+            extract_request_line(client->conn_buf, line_len, request_line, sizeof(request_line));
+            log_error_message("cannot recover pipeline boundary; request header is larger than %d bytes",
+                              MAX_HEADER_SIZE);
+            if (send_error_response(client->fd, 400) > 0) {
+                log_access_request(&client->addr, request_line, 400, 0);
+            }
+            client->conn_len = 0;
+            return -1;
+        }
+
+        extract_request_line(client->conn_buf, slice.header_len, request_line, sizeof(request_line));
+
+        if (pipeline_status == PIPELINE_BAD_REQUEST) {
+            /*
+             * 已经定位到当前错误请求的头部边界，返回 400 后只丢弃它；
+             * 当前客户端继续保留，其他客户端也不会被这个错误请求影响。
+             */
+            log_error_message("bad pipeline request header, consuming %zu bytes", slice.full_len);
+            if (send_error_response(client->fd, 400) < 0) {
+                log_error_message("send_all() failed while returning 400: %s", strerror(errno));
+                client->conn_len = 0;
+                return -1;
+            }
+            log_access_request(&client->addr, request_line, 400, 0);
+            discard_consumed_bytes(client->conn_buf, &client->conn_len, slice.full_len);
+            continue;
+        }
+
+        int request_type = classify_request_line(client->conn_buf, slice.header_len);
+        if (request_type == 0) {
+            if (send_error_response(client->fd, 400) < 0) {
+                log_error_message("send_all() failed while returning 400: %s", strerror(errno));
+                client->conn_len = 0;
+                return -1;
+            }
+            log_access_request(&client->addr, request_line, 400, 0);
+        } else if (request_type == -1) {
+            if (send_error_response(client->fd, 501) < 0) {
+                log_error_message("send_all() failed while returning 501: %s", strerror(errno));
+                client->conn_len = 0;
+                return -1;
+            }
+            log_access_request(&client->addr, request_line, 501, 0);
+        } else {
+            Request *request = parse(client->conn_buf, slice.header_len, client->fd);
+            int close_after_response = 0;
+            if (request == NULL) {
+                if (send_error_response(client->fd, 400) < 0) {
+                    log_error_message("send_all() failed after parse error: %s", strerror(errno));
+                    client->conn_len = 0;
+                    return -1;
+                }
+                log_access_request(&client->addr, request_line, 400, 0);
+                discard_consumed_bytes(client->conn_buf, &client->conn_len, slice.full_len);
+                continue;
+            }
+            /*
+             * HTTP/1.0 默认不具备 HTTP/1.1 的持久连接语义。
+             * 响应发送完成后主动关闭该客户端，可兼容 ab 等 HTTP/1.0 工具。
+             */
+            close_after_response = strcmp(request->http_version, "HTTP/1.0") == 0;
+
+            char *response = NULL;
+            int response_len =
+                build_encapsulated_request(request, client->conn_buf, slice.full_len, &response);
+
+            if (response_len <= 0 || response == NULL ||
+                send_all(client->fd, response, (size_t)response_len) < 0) {
+                log_error_message("send_all() failed for \"%s\": %s",
+                                  request_line,
+                                  strerror(errno));
+                free(response);
+                free_request(request);
+                client->conn_len = 0;
+                return -1;
+            }
+
+            log_access_request(&client->addr,
+                               request_line,
+                               response_status_code(response, response_len),
+                               response_body_bytes(response, response_len));
+            free(response);
+            free_request(request);
+
+            if (close_after_response) {
+                client->conn_len = 0;
+                return -1;
+            }
+        }
+
+        /* 丢弃已处理请求，继续解析该客户端缓冲区中的后续 pipeline 请求 */
+        discard_consumed_bytes(client->conn_buf, &client->conn_len, slice.full_len);
+    }
+}
+
+/* select 通知某客户端可读时调用：读取数据并处理该客户端自己的缓冲区 */
+static int handle_client_read(ClientConn *client) {
+    char read_buf[BUF_SIZE];
+    ssize_t readret;
+
+    if (client == NULL || !client->active) {
+        return -1;
+    }
+
+    readret = recv(client->fd, read_buf, sizeof(read_buf), 0);
+    if (readret < 0) {
+        if (errno == EINTR) {
+            return 0;
+        }
+        log_error_message("recv() failed from %s:%d: %s",
+                          inet_ntoa(client->addr.sin_addr),
+                          ntohs(client->addr.sin_port),
+                          strerror(errno));
+        return -1;
+    }
+
+    if (readret == 0) {
+        /* 对端关闭连接时若仍有残缺报文，按格式错误处理后清理该客户端 */
+        if (client->conn_len > 0 && !buffer_is_only_blank(client->conn_buf, client->conn_len)) {
+            char request_line[512];
+            extract_request_line(client->conn_buf,
+                                 client->conn_len > (size_t)INT_MAX ? INT_MAX : (int)client->conn_len,
+                                 request_line,
+                                 sizeof(request_line));
+            if (send_error_response(client->fd, 400) > 0) {
+                log_access_request(&client->addr, request_line, 400, 0);
+            }
+        }
+        return -1;
+    }
+
+    if (append_client_data(client, read_buf, (size_t)readret) != 0) {
+        return -1;
+    }
+
+    return process_client_buffer(client);
+}
+
 void handle_signal(const int sig) {
     if (sock != -1) {
         fprintf(stderr, "\nReceived signal %d. Closing socket.\n", sig);
@@ -806,9 +1091,10 @@ int main(int argc, char *argv[]) {
     signal(SIGHUP, handle_signal);
     /* normal I/O event */
     signal(SIGPIPE, handle_sigpipe);
-    socklen_t cli_size;
-    struct sockaddr_in addr, cli_addr;
+    struct sockaddr_in addr;
+    ClientConn clients[MAX_CLIENTS];
     init_logs();
+    init_clients(clients, MAX_CLIENTS);
     /* 评测脚本只检查网络响应，服务端标准输出保持安静可避免长流水线测试阻塞。 */
 
     /* all networked programs must create a socket */
@@ -837,209 +1123,74 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (listen(sock, 5)) {
+    if (listen(sock, MAX_CLIENTS)) {
         log_error_message("listen() failed: %s", strerror(errno));
         close_socket(sock);
         fprintf(stderr, "Error listening on socket.\n");
         return EXIT_FAILURE;
     }
 
-    /* finally, loop waiting for input and then write it back */
-
+    /*
+     * 第四阶段主循环：使用 select() 同时等待监听 socket 和所有客户端 socket。
+     * 这样某个客户端发送半个请求后暂停时，服务器仍能继续处理其它客户端。
+     */
     while (1) {
-        /* listen for new connection */
-        cli_size = sizeof(cli_addr);
-        client_sock = accept(sock, (struct sockaddr *) &cli_addr, &cli_size);
-        if (client_sock == -1)
-        {
-            log_error_message("accept() failed: %s", strerror(errno));
-            fprintf(stderr, "Error accepting connection.\n");
-            close_socket(sock);
-            return EXIT_FAILURE;
-        }
-        char *conn_buf = (char *)malloc(INITIAL_CONN_BUF_SIZE);
-        size_t conn_cap = INITIAL_CONN_BUF_SIZE;
-        size_t conn_len = 0;
-        int close_connection = 0;
+        fd_set read_fds;
+        int max_fd = sock;
+        int ready;
 
-        if (conn_buf == NULL) {
-            log_error_message("malloc() failed while creating connection buffer");
-            close_socket(client_sock);
-            continue;
+        FD_ZERO(&read_fds);
+        FD_SET(sock, &read_fds);
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active) {
+                FD_SET(clients[i].fd, &read_fds);
+                if (clients[i].fd > max_fd) {
+                    max_fd = clients[i].fd;
+                }
+            }
         }
 
-        while(1){
-
-            int readret = recv(client_sock, buf, BUF_SIZE, 0);
-            if (readret < 0) {
-                log_error_message("recv() failed from %s:%d: %s",
-                                  inet_ntoa(cli_addr.sin_addr),
-                                  ntohs(cli_addr.sin_port),
-                                  strerror(errno));
-                break;
+        ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
             }
-            if (readret == 0) {
-                /* 对端关闭连接时若仍有残缺报文，按格式错误处理 */
-                if (conn_len > 0 && !buffer_is_only_blank(conn_buf, conn_len)) {
-                    char request_line[512];
-                    extract_request_line(conn_buf, (int)conn_len, request_line, sizeof(request_line));
-                    if (send_error_response(client_sock, 400) > 0) {
-                        log_access_request(&cli_addr, request_line, 400, 0);
-                    }
-                }
-                break;
-            }
-
-            if (conn_len + (size_t)readret > conn_cap) {
-                size_t need = conn_len + (size_t)readret;
-                size_t new_cap = conn_cap;
-                char *new_buf = NULL;
-
-                /* 缓冲区只表示连接内暂存数据，不再把 body 大于 8192 当成头部错误 */
-                while (new_cap < need) {
-                    if (new_cap > (size_t)INT_MAX / 2) {
-                        new_cap = need;
-                        break;
-                    }
-                    new_cap *= 2;
-                }
-
-                new_buf = (char *)realloc(conn_buf, new_cap);
-                if (new_buf == NULL) {
-                    char request_line[512];
-                    extract_request_line(conn_buf, (int)conn_len, request_line, sizeof(request_line));
-                    log_error_message("realloc() failed while growing connection buffer to %zu bytes", new_cap);
-                    if (send_error_response(client_sock, 400) > 0) {
-                        log_access_request(&cli_addr, request_line, 400, 0);
-                    }
-                    close_connection = 1;
-                    break;
-                }
-                conn_buf = new_buf;
-                conn_cap = new_cap;
-            }
-
-            memcpy(conn_buf + conn_len, buf, (size_t)readret);
-            conn_len += (size_t)readret;
-            /* 关键逻辑：同一次 recv 中可能包含多个请求，循环逐个切分处理 */
-            while (1) {
-                PipelineRequestSlice slice;
-                PipelineStatus pipeline_status = extract_pipeline_request(conn_buf, conn_len, &slice);
-                char request_line[512];
-
-                if (pipeline_status == PIPELINE_NEED_MORE) {
-                    break;
-                }
-
-                if (pipeline_status == PIPELINE_FATAL_ERROR) {
-                    int line_len = conn_len > (size_t)INT_MAX ? INT_MAX : (int)conn_len;
-                    extract_request_line(conn_buf, line_len, request_line, sizeof(request_line));
-                    log_error_message("cannot recover pipeline boundary; request header is larger than %d bytes",
-                                      MAX_HEADER_SIZE);
-                    if (send_error_response(client_sock, 400) > 0) {
-                        log_access_request(&cli_addr, request_line, 400, 0);
-                    }
-                    conn_len = 0;
-                    close_connection = 1;
-                    break;
-                }
-
-                extract_request_line(conn_buf, slice.header_len, request_line, sizeof(request_line));
-
-                if (pipeline_status == PIPELINE_BAD_REQUEST) {
-                    /*
-                     * 已经定位到当前错误请求的头部边界，返回 400 后只丢弃它，
-                     * 不关闭连接，从而满足“错误请求后继续识别下一条请求”的要求。
-                     */
-                    log_error_message("bad pipeline request header, consuming %zu bytes", slice.full_len);
-                    if (send_error_response(client_sock, 400) < 0) {
-                        log_error_message("send_all() failed while returning 400: %s", strerror(errno));
-                        conn_len = 0;
-                        close_connection = 1;
-                        break;
-                    }
-                    log_access_request(&cli_addr, request_line, 400, 0);
-                    discard_consumed_bytes(conn_buf, &conn_len, slice.full_len);
-                    continue;
-                }
-
-                int request_type = classify_request_line(conn_buf, slice.header_len);
-                if (request_type == 0) {
-                    if (send_error_response(client_sock, 400) < 0) {
-                        log_error_message("send_all() failed while returning 400: %s", strerror(errno));
-                        conn_len = 0;
-                        close_connection = 1;
-                        break;
-                    }
-                    log_access_request(&cli_addr, request_line, 400, 0);
-                } else if (request_type == -1) {
-                    if (send_error_response(client_sock, 501) < 0) {
-                        log_error_message("send_all() failed while returning 501: %s", strerror(errno));
-                        conn_len = 0;
-                        close_connection = 1;
-                        break;
-                    }
-                    log_access_request(&cli_addr, request_line, 501, 0);
-                } else {
-                    Request *request = parse(conn_buf, slice.header_len, client_sock);
-                    if (request == NULL) {
-                        if (send_error_response(client_sock, 400) < 0) {
-                            log_error_message("send_all() failed after parse error: %s", strerror(errno));
-                            conn_len = 0;
-                            close_connection = 1;
-                            break;
-                        }
-                        log_access_request(&cli_addr, request_line, 400, 0);
-                        discard_consumed_bytes(conn_buf, &conn_len, slice.full_len);
-                        continue;
-                    }
-
-                    char *response = NULL;
-                    int response_len = -1;
-
-                    response_len = build_encapsulated_request(request, conn_buf, slice.full_len, &response);
-
-                    if (response_len <= 0 || response == NULL ||
-                        send_all(client_sock, response, (size_t)response_len) < 0) {
-                        log_error_message("send_all() failed for \"%s\": %s",
-                                          request_line,
-                                          strerror(errno));
-                        free(response);
-                        free_request(request);
-                        conn_len = 0;
-                        close_connection = 1;
-                        break;
-                    }
-
-                    log_access_request(&cli_addr,
-                                       request_line,
-                                       response_status_code(response, response_len),
-                                       response_body_bytes(response, response_len));
-                    free(response);
-                    free_request(request);
-                }
-
-                /* 丢弃已处理请求，继续解析剩余字节 */
-                discard_consumed_bytes(conn_buf, &conn_len, slice.full_len);
-            }
-
-            if (close_connection) {
-                break;
-            }
-
-            /* when client is closing the connection：
-                FIN of client carrys empty，so recv() return 0
-                ACK of server only carrys response data, so send() return 11
-                ACK of client carrys empty, so recv() return 0
-                Then server finishes closing the connection, recv() and send() return -1 */
+            log_error_message("select() failed: %s", strerror(errno));
+            break;
         }
-        free(conn_buf);
-        /* client closes the connection. server free resources and listen again */
-        if (close_socket(client_sock))
-        {
-            close_socket(sock);
-            fprintf(stderr, "Error closing client socket.\n");
-            return EXIT_FAILURE;
+
+        if (FD_ISSET(sock, &read_fds)) {
+            struct sockaddr_in cli_addr;
+            socklen_t cli_size = sizeof(cli_addr);
+            int new_client = accept(sock, (struct sockaddr *) &cli_addr, &cli_size);
+
+            if (new_client == -1) {
+                log_error_message("accept() failed: %s", strerror(errno));
+            } else if (add_client(clients, MAX_CLIENTS, new_client, &cli_addr) != 0) {
+                close_socket(new_client);
+            }
+
+            if (--ready <= 0) {
+                continue;
+            }
+        }
+
+        for (int i = 0; i < MAX_CLIENTS && ready > 0; i++) {
+            if (!clients[i].active || !FD_ISSET(clients[i].fd, &read_fds)) {
+                continue;
+            }
+
+            ready--;
+            if (handle_client_read(&clients[i]) != 0) {
+                close_client(&clients[i]);
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active) {
+            close_client(&clients[i]);
         }
     }
     close_socket(sock);
